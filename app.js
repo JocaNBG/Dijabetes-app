@@ -1,20 +1,26 @@
 let db;
+let chart;
+
+// filteri
+let filteredZone = null;
 let filteredStart = null;
 let filteredEnd = null;
-let chart;
-let filteredZone = null;
 
 window.onload = function () {
   initDB();
   initChart();
-  document.getElementById("commentSelect").addEventListener("change", commentChanged);
+  const sel = document.getElementById("commentSelect");
+  if (sel) sel.addEventListener("change", commentChanged);
 };
 
+/* =================== DB =================== */
 function initDB() {
   const request = indexedDB.open("glucoseDB", 1);
   request.onupgradeneeded = function (e) {
     db = e.target.result;
-    db.createObjectStore("entries", { keyPath: "id", autoIncrement: true });
+    if (!db.objectStoreNames.contains("entries")) {
+      db.createObjectStore("entries", { keyPath: "id", autoIncrement: true });
+    }
   };
   request.onsuccess = function (e) {
     db = e.target.result;
@@ -22,20 +28,22 @@ function initDB() {
   };
 }
 
-
+/* =============== Helpers (datum/vreme) =============== */
 function pad2(n){ return String(n).padStart(2,'0'); }
+
 function normalizeDate(dateStr){
   if(!dateStr) return "";
   const s = dateStr.trim();
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
-  let m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;                  // ISO
+  let m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);            // d.m.yyyy
   if (m) return `${m[3]}-${pad2(m[2])}-${pad2(m[1])}`;
-  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);                // d/m/yyyy
   if (m) return `${m[3]}-${pad2(m[2])}-${pad2(m[1])}`;
   const dt = new Date(s);
   if (!isNaN(dt.getTime())) return `${dt.getFullYear()}-${pad2(dt.getMonth()+1)}-${pad2(dt.getDate())}`;
   return s;
 }
+
 function normalizeTime(timeStr){
   if(!timeStr) return "";
   const s = timeStr.trim().replace(".",":");
@@ -45,16 +53,27 @@ function normalizeTime(timeStr){
   if (m) return `${pad2(parseInt(m[1],10))}:${pad2(parseInt(m[2],10))}`;
   return s;
 }
+
+// UI prikaz datuma (srpski format), bez uticaja na sortiranje/filtre
+function displayDate(d){
+  const iso = normalizeDate(d);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(iso)) return d;
+  const [y, m, day] = iso.split("-");
+  return `${parseInt(day,10)}.${parseInt(m,10)}.${y}`;
+}
+
+// realni timestamp za sortiranje
 function toTimestamp(entry){
   const d = normalizeDate(entry.date);
   const t = normalizeTime(entry.time || "00:00");
   return new Date(`${d}T${t}`).getTime();
 }
 
+/* =================== UI helpers =================== */
 function commentChanged() {
   const sel = document.getElementById("commentSelect");
   const input = document.getElementById("comment");
-  input.style.display = sel.value === "custom" ? "inline-block" : "none";
+  if (input) input.style.display = sel && sel.value === "custom" ? "inline-block" : "none";
 }
 
 function getTimeZoneLabel(hour) {
@@ -65,6 +84,7 @@ function getTimeZoneLabel(hour) {
   return "noc";
 }
 
+/* =================== Unos =================== */
 function addEntry() {
   const date = document.getElementById("date").value;
   const time = document.getElementById("time").value;
@@ -77,7 +97,7 @@ function addEntry() {
 
   const entry = {
     date, time, glucose, comment, emojis,
-    zone: getTimeZoneLabel(parseInt(time.split(":")[0]))
+    zone: getTimeZoneLabel(parseInt(time.split(":")[0],10))
   };
 
   const tx = db.transaction("entries", "readwrite");
@@ -86,6 +106,7 @@ function addEntry() {
   tx.oncomplete = () => loadEntries();
 }
 
+/* =================== Učitavanje / prikaz =================== */
 function loadEntries() {
   const tbody = document.querySelector("#logTable tbody");
   tbody.innerHTML = "";
@@ -98,12 +119,17 @@ function loadEntries() {
       entries.push({ id: cursor.key, ...cursor.value });
       cursor.continue();
     } else {
-      // Sort reverse chrono
+      // tabela: novije → starije (DESC)
       entries.sort((a, b) => toTimestamp(b) - toTimestamp(a));
+
       const filtered = getFilteredEntries(entries);
       filtered.forEach(addRow);
+
+      // grafik: starije → novije (ASC)
       updateChart(filtered);
-      updateCalendar(entries);
+
+      // ako koristiš kalendar, ostavi kako je bilo
+      if (typeof updateCalendar === "function") updateCalendar(entries);
     }
   };
 }
@@ -113,12 +139,23 @@ function addRow(entry) {
 
   const tr = document.createElement("tr");
   tr.innerHTML = `
-    <td>${entry.date}</td>
-    <td>${entry.time}</td>
+    <td>${displayDate(entry.date)}</td>
+    <td>${normalizeTime(entry.time)}</td>
     <td>${entry.glucose}</td>
-    <td>${entry.comment} ${entry.emojis || ""}</td>
+    <td>${entry.comment || ""} ${entry.emojis || ""}</td>
   `;
   document.querySelector("#logTable tbody").appendChild(tr);
+}
+
+/* =================== Filteri =================== */
+function getFilteredEntries(entries){
+  return entries.filter(e => {
+    if (filteredZone && e.zone !== filteredZone) return false;
+    const d = normalizeDate(e.date);
+    if (filteredStart && d < filteredStart) return false;
+    if (filteredEnd && d > filteredEnd) return false;
+    return true;
+  });
 }
 
 function filterBy(zone) {
@@ -126,11 +163,24 @@ function filterBy(zone) {
   loadEntries();
 }
 
-function resetFilter() {
-  filteredZone = null;
+function applyDateFilters(){
+  const s = document.getElementById('startDate');
+  const e = document.getElementById('endDate');
+  filteredStart = s && s.value ? normalizeDate(s.value) : null;
+  filteredEnd   = e && e.value ? normalizeDate(e.value) : null;
   loadEntries();
 }
 
+function resetFilter(){
+  filteredZone = null;
+  filteredStart = null;
+  filteredEnd = null;
+  const s = document.getElementById('startDate'); if (s) s.value = '';
+  const e = document.getElementById('endDate');   if (e) e.value = '';
+  loadEntries();
+}
+
+/* =================== Ostalo =================== */
 function clearAll() {
   const req = indexedDB.deleteDatabase("glucoseDB");
   req.onsuccess = () => location.reload();
@@ -141,19 +191,35 @@ function importCSV() {
   if (!file) return;
   const reader = new FileReader();
   reader.onload = function (e) {
-    const lines = e.target.result.split("\n").slice(1);
+    const raw = e.target.result;
+    const lines = raw.split(/\r?\n/).filter(Boolean);
+    const startIdx = lines[0].toLowerCase().startsWith("date") ? 1 : 0;
+
     const tx = db.transaction("entries", "readwrite");
     const store = tx.objectStore("entries");
 
-    lines.forEach(line => {
-      const [date, time, glucose, comment] = line.split(",");
-      if (date && time && glucose) {
+    for (let i = startIdx; i < lines.length; i++) {
+      const row = lines[i];
+
+      // uzmi prva tri polja kao date,time,glucose; ostatak je comment (može da sadrži zareze)
+      let parts = row.match(/^(.*?),(.*?),(.*?),(.*)$/);
+      if (!parts) parts = row.split(",");
+      else parts = [parts[1], parts[2], parts[3], parts[4]];
+
+      const date = (parts[0] || "").trim();
+      const time = (parts[1] || "").trim();
+      const glucose = parseFloat((parts[2] || "").trim());
+      let comment = (parts.slice(3).join(",") || "").trim();
+      comment = comment.replace(/^\"|\"$/g,"");
+
+      if (date && time && !isNaN(glucose)) {
         store.add({
-          date, time, glucose: parseFloat(glucose),
-          comment, emojis: "", zone: getTimeZoneLabel(parseInt(time.split(":")[0]))
+          date, time, glucose,
+          comment, emojis: "",
+          zone: getTimeZoneLabel(parseInt(time.split(":")[0],10))
         });
       }
-    });
+    }
     tx.oncomplete = () => loadEntries();
   };
   reader.readAsText(file);
@@ -169,8 +235,11 @@ function exportCSV() {
       cursor.continue();
     } else {
       let csv = "date,time,glucose,comment\n";
-      entries.forEach(e => {
-        csv += `${e.date},${e.time},${e.glucose},"${e.comment} ${e.emojis || ""}"\n`;
+      // izvozimo kako su uneti (ne diramo format)
+      entries.forEach(r => {
+        const comment = (r.comment || "") + (r.emojis ? (" " + r.emojis) : "");
+        const safeComment = '"' + comment.replace(/"/g,'""') + '"';
+        csv += `${r.date},${r.time},${r.glucose},${safeComment}\n`;
       });
       const blob = new Blob([csv], { type: "text/csv" });
       const link = document.createElement("a");
@@ -181,57 +250,30 @@ function exportCSV() {
   };
 }
 
+/* =================== Grafik =================== */
 function initChart() {
-  const ctx = document.getElementById("glucoseChart").getContext("2d");
+  const el = document.getElementById("glucoseChart");
+  if (!el) return;
+  const ctx = el.getContext("2d");
   chart = new Chart(ctx, {
     type: "line",
     data: {
       labels: [],
-      datasets: [{
-        label: "Glukoza (mmol/L)",
-        data: [],
-        fill: false,
-        tension: 0.3
-      }]
+      datasets: [{ label: "Glukoza (mmol/L)", data: [], fill: false, tension: 0.3 }]
     },
     options: {
-      scales: {
-        y: { beginAtZero: true, max: 20 }
-      }
+      scales: { y: { beginAtZero: true, suggestedMax: 20 } }
     }
   });
 }
 
 function updateChart(entries) {
-  const labels = entries.map(e => `${e.date} ${e.time}`);
-  const data = entries.map(e => e.glucose);
+  if (!chart) return;
+  // ASC: starije -> novije (levo -> desno)
+  const sorted = [...entries].sort((a,b)=> toTimestamp(a) - toTimestamp(b));
+  const labels = sorted.map(e => `${displayDate(e.date)} ${normalizeTime(e.time)}`);
+  const data   = sorted.map(e => e.glucose);
   chart.data.labels = labels;
   chart.data.datasets[0].data = data;
   chart.update();
-}
-function getFilteredEntries(entries){
-  return entries.filter(e => {
-    if (typeof filteredZone !== 'undefined' && filteredZone && e.zone !== filteredZone) return false;
-    const d = normalizeDate(e.date);
-    if (filteredStart && d < filteredStart) return false;
-    if (filteredEnd && d > filteredEnd) return false;
-    return true;
-  });
-}
-
-function applyDateFilters(){
-  const s = document.getElementById('startDate');
-  const e = document.getElementById('endDate');
-  filteredStart = s && s.value ? normalizeDate(s.value) : null;
-  filteredEnd = e && e.value ? normalizeDate(e.value) : null;
-  loadEntries();
-}
-
-// override to also clear date period
-function resetFilter(){
-  if (typeof filteredZone !== 'undefined') filteredZone = null;
-  filteredStart = null; filteredEnd = null;
-  const s = document.getElementById('startDate'); if (s) s.value = '';
-  const e = document.getElementById('endDate');   if (e) e.value = '';
-  loadEntries();
 }
